@@ -51,6 +51,8 @@ cat << EOF > "${APP_DIR}/Contents/Info.plist"
     <string>${DEPLOY_TARGET}</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>LSUIElement</key>
+    <true/>
     <key>LSBackgroundOnly</key>
     <false/>
     <key>CFBundleIconFile</key>
@@ -68,6 +70,7 @@ swiftc -sdk "$(xcrun --show-sdk-path --sdk macosx)" \
        "${WORKSPACE_DIR}/PhyModeLabel.swift" \
        "${WORKSPACE_DIR}/IfconfigParser.swift" \
        "${WORKSPACE_DIR}/InternetSharingConfig.swift" \
+       "${WORKSPACE_DIR}/MenuBarSupport.swift" \
        "${WORKSPACE_DIR}/main.swift" \
        -o "${MACOS_DIR}/AirBridge"
 

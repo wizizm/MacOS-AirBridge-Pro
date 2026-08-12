@@ -220,6 +220,12 @@ enum L10nKey: String, CaseIterable {
     case staticLeaseSuccess
     case dhcpConfigError
     case copiedToClipboard
+
+    // menu bar
+    case menuOpen
+    case menuHelp
+    case menuQuit
+    case menuCheckUpdates
 }
 
 struct L10n {
@@ -445,6 +451,11 @@ extension L10n {
         .staticLeaseSuccess: "Static lease configured inside /etc/bootpd.plist (MAC %@ ➡️ IP %@).",
         .dhcpConfigError: "DHCP Config Error: %@",
         .copiedToClipboard: "Copied %@ %@ to Clipboard.",
+
+        .menuOpen: "Open AirBridge",
+        .menuHelp: "Help",
+        .menuQuit: "Quit AirBridge",
+        .menuCheckUpdates: "Check for Updates (AirBridge v%@)",
     ]
 }
 
@@ -642,5 +653,10 @@ extension L10n {
         .staticLeaseSuccess: "已在 /etc/bootpd.plist 配置静态租约（MAC %@ ➡️ IP %@）。",
         .dhcpConfigError: "DHCP 配置错误：%@",
         .copiedToClipboard: "已将 %@ %@ 复制到剪贴板。",
+
+        .menuOpen: "打开 AirBridge",
+        .menuHelp: "帮助",
+        .menuQuit: "退出 AirBridge",
+        .menuCheckUpdates: "检查更新（AirBridge v%@）",
     ]
 }

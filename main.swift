@@ -1962,13 +1962,16 @@ struct NavigationButton: View {
                     .font(.system(.subheadline, design: .rounded))
                     .fontWeight(.semibold)
                 
-                Spacer()
+                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 8)
             .padding(.horizontal, 14)
             .background(isSelected ? Color.primary.opacity(0.12) : Color.clear)
             .foregroundColor(isSelected ? .primary : .secondary)
             .cornerRadius(8)
+            // plain Button only hit-tests opaque glyphs; expand the full row.
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 10)
@@ -2134,9 +2137,33 @@ struct SetupMethodCard: View {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
+    var statusItem: NSStatusItem!
+    private var statusMenu: NSMenu!
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        setupMainWindow()
+        setupStatusItem()
+        // Start hidden in menu bar; user opens via status item click.
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showMainWindow()
+        return true
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
+
+    private func setupMainWindow() {
         let contentView = ContentView()
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 900, height: 640),
@@ -2147,11 +2174,79 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.contentView = NSHostingView(rootView: contentView)
+        window.delegate = self
+        window.isReleasedWhenClosed = false
+    }
+
+    private func setupStatusItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem.button {
+            let image = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: L10n.text(.appName))
+            image?.isTemplate = true
+            button.image = image
+            button.target = self
+            button.action = #selector(statusItemClicked(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+
+        statusMenu = NSMenu()
+        statusMenu.addItem(NSMenuItem(title: L10n.text(.menuOpen), action: #selector(showMainWindow), keyEquivalent: "o"))
+        let version = airbridgeLocalShortVersion()
+        statusMenu.addItem(NSMenuItem(
+            title: L10n.format(.menuCheckUpdates, version),
+            action: #selector(checkForUpdates),
+            keyEquivalent: ""
+        ))
+        statusMenu.addItem(NSMenuItem(title: L10n.text(.menuHelp), action: #selector(openHelp), keyEquivalent: ""))
+        statusMenu.addItem(NSMenuItem.separator())
+        statusMenu.addItem(NSMenuItem(title: L10n.text(.menuQuit), action: #selector(quitApp), keyEquivalent: "q"))
+        statusMenu.items.forEach { $0.target = self }
+    }
+
+    @objc private func statusItemClicked(_ sender: Any?) {
+        guard let event = NSApp.currentEvent else {
+            showMainWindow()
+            return
+        }
+        if event.type == .rightMouseUp {
+            statusItem.menu = statusMenu
+            statusItem.button?.performClick(nil)
+            // Clear so the next left-click runs action instead of popping the menu.
+            DispatchQueue.main.async { [weak self] in
+                self?.statusItem.menu = nil
+            }
+        } else {
+            showMainWindow()
+        }
+    }
+
+    @objc func showMainWindow() {
+        guard let window else { return }
+        if let screen = window.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            let frame = window.frame
+            if shouldRecenterWindow(frame: frame, screenVisible: visible) {
+                window.center()
+            }
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return true
+
+    @objc private func openHelp() {
+        if let url = URL(string: airbridgeHelpURL()) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func checkForUpdates() {
+        if let url = URL(string: airbridgeReleasesURL()) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
     }
 }
 

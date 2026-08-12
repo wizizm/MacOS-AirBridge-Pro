@@ -105,6 +105,40 @@ else
   fail "bypass loads NAT into system nat-anchor (no stdin wipe)"
 fi
 
+if grep -q 'LSUIElement' "$ROOT/build.sh"; then
+  pass "build.sh sets LSUIElement for menu-bar app"
+else
+  fail "build.sh sets LSUIElement for menu-bar app"
+fi
+
+if grep -q 'NSStatusItem' "$ROOT/main.swift" \
+  && grep -q 'MenuBarSupport.swift' "$ROOT/build.sh"; then
+  pass "main uses NSStatusItem; build compiles MenuBarSupport"
+else
+  fail "main uses NSStatusItem; build compiles MenuBarSupport"
+fi
+
+if grep -q 'applicationShouldTerminateAfterLastWindowClosed' "$ROOT/main.swift" \
+  && grep -A2 'applicationShouldTerminateAfterLastWindowClosed' "$ROOT/main.swift" | grep -q 'false'; then
+  pass "closing last window does not quit menu-bar app"
+else
+  fail "closing last window does not quit menu-bar app"
+fi
+
+if grep -q 'menuOpen\|menuHelp\|menuQuit\|menuCheckUpdates' "$ROOT/L10n.swift"; then
+  pass "L10n has menu bar keys"
+else
+  fail "L10n has menu bar keys"
+fi
+
+# Sidebar Nav: plain Button hit-tests only opaque glyphs unless contentShape expands the row.
+if slice_main "struct NavigationButton" "struct TopologyNode" | grep -q 'contentShape' \
+  && slice_main "struct NavigationButton" "struct TopologyNode" | grep -q 'maxWidth: .infinity'; then
+  pass "NavigationButton expands full-row hit target"
+else
+  fail "NavigationButton expands full-row hit target"
+fi
+
 if grep -q 'L10n.swift' "$ROOT/build.sh"; then
   pass "build.sh compiles L10n.swift"
 else
@@ -241,7 +275,20 @@ else
   fail "InternetSharingConfig failed to compile"
   cat "$COMPILE_ERR"
 fi
-rm -f "$ISC_BIN" "$COMPILE_ERR"
+rm -f "$ISC_BIN"
+
+MBS_BIN="$(mktemp /tmp/menu_bar_support_test.XXXXXX)"
+if swiftc "$ROOT/MenuBarSupport.swift" "$ROOT/tests/test_menu_bar_support.swift" -parse-as-library -o "$MBS_BIN" 2>"$COMPILE_ERR"; then
+  if "$MBS_BIN"; then
+    pass "MenuBarSupport unit tests"
+  else
+    fail "MenuBarSupport unit tests"
+  fi
+else
+  fail "MenuBarSupport failed to compile"
+  cat "$COMPILE_ERR"
+fi
+rm -f "$MBS_BIN" "$COMPILE_ERR"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "Compatibility tests failed."
