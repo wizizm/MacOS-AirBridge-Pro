@@ -4,16 +4,18 @@ AirBridge Pro is a native, high-performance, ultra-lightweight macOS desktop app
 
 The application operates in real-time, defaulting to a gorgeous **`860x640` glassmorphic window** that is fully **resizable** to accommodate larger displays and resolve clipping. It packages automatically with a custom App Icon and a dedicated Developer profile section for **Tiwut**.
 
+UI language follows the system preferred language: any `zh*` locale uses Simplified Chinese; otherwise English (`L10n.swift` / `AppLanguage.resolve`).
+
 ---
 
 ## Features
 
-AirBridge Pro wraps low-level macOS system diagnostics and packet daemons (`pfctl`, `dnctl`, `tcpdump`, `netstat`, `defaults`) inside a secure administrative privilege manager:
+AirBridge Pro wraps low-level macOS system diagnostics and packet daemons (`pfctl`, `dnctl`, `tcpdump`, `defaults`) inside a secure administrative privilege manager:
 
 1. **One-Click Integrated Hotspot Toggler:** Dynamically writes to `/Library/Preferences/SystemConfiguration/com.apple.nat.plist` to bridge incoming internet (e.g. `en0`) to a secondary AP adapter (e.g. `en1`), loading the sharing daemon with a single secure prompt.
 2. **WLAN Telemetry & Channel Analyzer:** Displays active RSSI signal (dBm), Noise (dBm), SNR, live Link Tx Rate (Mbps), radio channel, and PHY mode (e.g. Wi-Fi 6) utilizing the native `CoreWLAN` framework.
 3. **Active Client Firewall Blocker:** Instantly blocks or kicks devices from the bridge network by inserting drop rules into the macOS Packet Filter (`pfctl`) anchor list.
-4. **Data Speedometer & Bandwidth Meter:** Computes real-time download and upload speeds (KB/s) and tracks cumulative traffic (MB) using `netstat -ib` metrics.
+4. **Data Speedometer & Bandwidth Meter:** Computes real-time download and upload speeds (KB/s) and tracks cumulative traffic (MB) via `getifaddrs` byte counters.
 5. **Fast DNS Server Redirects:** Toggles shared clients DNS configuration between defaults, Cloudflare Fast DNS, Google Public DNS, or AdGuard (AdBlocker) DNS by updating `bootpd.plist` dynamically.
 6. **Port Forwarding Redirection Manager:** Maps external ports on your Mac directly to internal client IP addresses using custom `pfctl` NAT redirects.
 7. **Local Packet Sniffer Terminal Console:** A live-buffered console snoop that captures active IP packet communication on the bridge interface via `tcpdump`.
@@ -25,24 +27,36 @@ AirBridge Pro wraps low-level macOS system diagnostics and packet daemons (`pfct
 
 ## Project Anatomy
 
-* **`main.swift`:** The standalone Swift codebase containing the AppKit shell window parameters, the low-level CLI parsers, the AppleScript escalation routines, and the SwiftUI GUI dashboard. Contains **zero code comments** for a pristine, minimalist file layout.
-* **`build.sh`:** A comments-free compilation script that downloads the custom developer icon, resizes it into macOS bundle specifications via `sips`, compiles it into an `AppIcon.icns` file, packages the metadata `Info.plist`, and compiles `main.swift` natively using the Apple Swift Compiler (`swiftc`).
-* **`AirBridge.app`:** The resulting standalone application bundle. Size is only **1.1 Megabytes**, starting instantaneously and consuming under 15MB of RAM.
+* **`main.swift`:** AppKit shell, CLI parsers, AppleScript escalation, and SwiftUI dashboard.
+* **`L10n.swift`:** Bilingual UI strings (English / Simplified Chinese) keyed via `L10n.text` / `L10n.format`.
+* **`PhyModeLabel.swift`:** CoreWLAN PHY mode → label mapping via rawValue (works without SDK `.mode11be`).
+* **`IfconfigParser.swift`:** Pure parsers for `ifconfig` plus `getifaddrs` byte counters (unit-tested).
+* **`build.sh`:** Portable build (script-relative paths), icon packaging, `Info.plist`, and `swiftc` for host `arm64`/`x86_64` at macOS **15.0**.
+* **`tests/test_compat.sh`:** Compatibility + performance guards (off-main refresh, no shell in Developer view).
+* **`AirBridge.app`:** The resulting standalone application bundle.
 
 ---
 
 ## Build and Run Instructions
 
 ### 1. Compile the App
-To rebuild the app bundle dynamically in the future, navigate to the folder and run:
+Rebuild on the Mac that will run the app (the checked-in binary may target a newer macOS than yours). Navigate to the folder and run:
 ```bash
 ./build.sh
+./tests/test_compat.sh   # optional: path/SDK/PHY-mode compatibility checks
 ```
+Requires Xcode Command Line Tools / macOS SDK. The build targets the host architecture at macOS 15.0.
 
 ### 2. Launch the App
-Open the app bundle in Finder or run the following shell command to launch the resizable native desktop window:
+Open **this folder’s** `AirBridge.app` (not an older copy under Downloads/DMG — macOS App Translocation can keep launching the stale bundle):
 ```bash
-open AirBridge.app
+open "$(pwd)/AirBridge.app"
+```
+
+If Finder says the app is damaged (usually after download/copy), rebuild with `./build.sh`, or clear quarantine:
+```bash
+xattr -cr AirBridge.app
+codesign --force --deep --sign - AirBridge.app
 ```
 
 ---

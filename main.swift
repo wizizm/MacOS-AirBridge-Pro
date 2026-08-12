@@ -70,7 +70,7 @@ class AdminManager {
         if let output = appleScript?.executeAndReturnError(&errorInfo) {
             return (output.stringValue ?? "", true)
         } else {
-            let errorMsg = errorInfo?[NSAppleScript.errorMessage] as? String ?? "Authorization Failed"
+            let errorMsg = errorInfo?[NSAppleScript.errorMessage] as? String ?? L10n.text(.authorizationFailed)
             return (errorMsg, false)
         }
     }
@@ -81,14 +81,16 @@ class NetworkMonitor: ObservableObject {
     @Published var connectedClients: [ConnectedClient] = []
     @Published var isInternetSharingActive: Bool = false
     @Published var sharingBridgeIP: String? = nil
+    /// Non-VM Internet Sharing bridge device (e.g. bridge50); set on refreshQueue for speedometer/sniffer.
+    private var sharingBridgeDevice: String? = nil
     @Published var isScanning: Bool = false
-    @Published var wlanSSID: String = "Not Connected"
+    @Published var wlanSSID: String = L10n.text(.wlanNotConnected)
     @Published var wlanBSSID: String = "--:--:--:--:--:--"
     @Published var wlanRSSI: Int = 0
     @Published var wlanNoise: Int = 0
     @Published var wlanTxRate: Double = 0.0
     @Published var wlanChannel: Int = 0
-    @Published var wlanPhyMode: String = "Unknown"
+    @Published var wlanPhyMode: String = L10n.text(.wlanPhyUnknown)
     @Published var downloadSpeed: Double = 0.0
     @Published var uploadSpeed: Double = 0.0
     @Published var totalDownloadMB: Double = 0.0
@@ -109,22 +111,64 @@ class NetworkMonitor: ObservableObject {
     private var lastInBytes: Double = 0.0
     private var lastOutBytes: Double = 0.0
     private var lastSpeedCheckTime = Date()
+    private var lastSpeedInterface: String = ""
+    private let refreshQueue = DispatchQueue(label: "com.antigravity.AirBridge.refresh", qos: .utility)
+    private var refreshTick: Int = 0
     
     init() {
-        refreshData()
+        schedulePeriodicRefresh(full: true)
         timer = Timer.publish(every: 3.0, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
-                self?.refreshData()
-                self?.refreshSpeedometer()
-                self?.refreshWLANTelemetry()
+                self?.schedulePeriodicRefresh(full: false)
             }
+    }
+    
+    /// Heavy shell work stays off the main thread so the SwiftUI window stays responsive.
+    func schedulePeriodicRefresh(full: Bool) {
+        refreshTick += 1
+        let runFull = full || refreshTick % 3 == 1
+        // Snapshot main-thread state before leaving main (avoid data races on Sets / @Published).
+        let sharingActive = isInternetSharingActive
+        let blockedSnapshot = blockedMacs
+        let reservedSnapshot = reservedIPs
+        refreshQueue.async { [weak self] in
+            guard let self else { return }
+            if runFull {
+                self.refreshData(blocked: blockedSnapshot, reserved: reservedSnapshot)
+            }
+            self.refreshSpeedometer(sharingActive: sharingActive)
+            // CoreWiFi SSID/BSSID are sync XPC — never call from the main thread.
+            if runFull {
+                self.refreshWLANTelemetry()
+            }
+        }
+    }
+    
+    /// Enqueue a full refresh from any thread without blocking the main run loop.
+    private func enqueueRefreshData() {
+        let blockedSnapshot: Set<String>
+        let reservedSnapshot: [String: String]
+        if Thread.isMainThread {
+            blockedSnapshot = blockedMacs
+            reservedSnapshot = reservedIPs
+        } else {
+            // Capture on main without deadlocking refreshQueue (never call this while holding main→refreshQueue wait).
+            (blockedSnapshot, reservedSnapshot) = DispatchQueue.main.sync {
+                (self.blockedMacs, self.reservedIPs)
+            }
+        }
+        refreshQueue.async { [weak self] in
+            self?.refreshData(blocked: blockedSnapshot, reserved: reservedSnapshot)
+        }
     }
     
     func forceScan() {
         isScanning = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.refreshData()
+        let blockedSnapshot = blockedMacs
+        let reservedSnapshot = reservedIPs
+        refreshQueue.async {
+            self.refreshData(blocked: blockedSnapshot, reserved: reservedSnapshot)
             self.refreshWLANTelemetry()
             DispatchQueue.main.async {
                 self.isScanning = false
@@ -132,13 +176,24 @@ class NetworkMonitor: ObservableObject {
         }
     }
     
-    func refreshData() {
+    /// - Note: Must run on `refreshQueue`. Pass snapshots of main-actor collections to avoid races.
+    func refreshData(blocked: Set<String>? = nil, reserved: [String: String]? = nil) {
+        let blockedMacsLocal = blocked ?? blockedMacs
+        let reservedIPsLocal = reserved ?? reservedIPs
         let hardwarePorts = parseHardwarePorts()
-        let ipAddresses = parseIPAddresses()
-        let activeSSIDs = fetchSSIDs(interfaces: hardwarePorts.keys.map { String($0) })
+        let ifconfigRaw = shell("ifconfig")
+        let addresses = parseIfconfigOutput(ifconfigRaw)
+        let ipAddresses = addresses.ips
+        let wifiDevices = hardwarePorts.compactMap { device, type -> String? in
+            let lowered = type.lowercased()
+            return (lowered.contains("wi-fi") || lowered.contains("airport")) ? device : nil
+        }
+        let activeSSIDs = fetchSSIDs(interfaces: wifiDevices)
         var detectedInterfaces: [NetworkInterface] = []
+        var listed = Set<String>()
         for (device, type) in hardwarePorts {
-            let mac = fetchMACAddress(device: device)
+            listed.insert(device)
+            let mac = addresses.macs[device] ?? L10n.text(.macUnknown)
             let ip = ipAddresses[device]
             let ssid = activeSSIDs[device]
             let isActive = ip != nil && !ip!.isEmpty
@@ -151,8 +206,41 @@ class NetworkMonitor: ObservableObject {
                 isActive: isActive
             ))
         }
-        let bridgeIP = ipAddresses["bridge100"] ?? ipAddresses["bridge0"]
-        let hasActiveBridge = bridgeIP != nil
+        // iPhone USB often appears as a dynamic en* (e.g. en8) not listed by networksetup.
+        for device in addresses.macs.keys.sorted() where device.hasPrefix("en") && !listed.contains(device) {
+            let block = ifconfigBlock(named: device, in: ifconfigRaw)
+            guard block.contains("status: active") else { continue }
+            detectedInterfaces.append(NetworkInterface(
+                device: device,
+                type: "USB/Link",
+                macAddress: addresses.macs[device] ?? L10n.text(.macUnknown),
+                ipAddress: ipAddresses[device],
+                ssid: nil,
+                isActive: ipAddresses[device] != nil
+            ))
+        }
+        let selectedBridge = selectInternetSharingBridge(ipAddresses: ipAddresses, ifconfigOutput: ifconfigRaw)
+        var bridgeIP = selectedBridge?.ip
+        self.sharingBridgeDevice = selectedBridge?.name
+        let natEnabledRaw = shell("plutil -extract NAT.Enabled raw /Library/Preferences/SystemConfiguration/com.apple.nat.plist 2>/dev/null")
+        let natDevicesRaw = shell("plutil -extract NAT.SharingDevices json -o - /Library/Preferences/SystemConfiguration/com.apple.nat.plist 2>/dev/null")
+        let natOn = isNatInternetSharingEnabled(
+            enabledFlag: parseNatEnabledExtract(natEnabledRaw),
+            sharingDevices: parseNatSharingDevicesJSON(natDevicesRaw)
+        )
+        let markerRaw = (try? String(contentsOfFile: airbridgeShareMarkerPath, encoding: .utf8)) ?? ""
+        let marker = parseAirbridgeShareMarker(markerRaw)
+        let bypassTarget = marker?.target
+        let bypassTargetBlock = bypassTarget.map { ifconfigBlock(named: $0, in: ifconfigRaw) } ?? ""
+        let bypassOn = isBypassInternetSharingActive(
+            markerExists: marker != nil,
+            targetHasShareIP: interfaceHasShareGatewayIP(ifconfigBlock: bypassTargetBlock)
+        )
+        if bypassOn, let target = bypassTarget {
+            self.sharingBridgeDevice = target
+            bridgeIP = airbridgeShareGatewayIP
+        }
+        let sharingOn = natOn || bypassOn
         let leases = parseDHCPLeases()
         let activeARPMapping = parseARPCache()
         var clients: [ConnectedClient] = []
@@ -160,8 +248,8 @@ class NetworkMonitor: ObservableObject {
             let isCurrent = activeARPMapping[lease.macAddress] != nil || activeARPMapping[lease.ipAddress] != nil
             var client = lease
             client.isActive = isCurrent
-            client.isBlocked = blockedMacs.contains(client.macAddress.lowercased())
-            client.isReserved = reservedIPs[client.macAddress.lowercased()] != nil
+            client.isBlocked = blockedMacsLocal.contains(client.macAddress.lowercased())
+            client.isReserved = reservedIPsLocal[client.macAddress.lowercased()] != nil
             clients.append(client)
         }
         var uniqueClients = [String: ConnectedClient]()
@@ -169,70 +257,63 @@ class NetworkMonitor: ObservableObject {
             uniqueClients[client.macAddress.lowercased()] = client
         }
         let sortedClients = Array(uniqueClients.values).sorted(by: { $0.ipAddress < $1.ipAddress })
+        let sortedInterfaces = detectedInterfaces.sorted(by: { $0.device < $1.device })
         DispatchQueue.main.async {
-            self.interfaces = detectedInterfaces.sorted(by: { $0.device < $1.device })
-            self.connectedClients = sortedClients
-            self.isInternetSharingActive = hasActiveBridge
-            self.sharingBridgeIP = bridgeIP
+            if self.interfaces != sortedInterfaces { self.interfaces = sortedInterfaces }
+            if self.connectedClients != sortedClients { self.connectedClients = sortedClients }
+            if self.isInternetSharingActive != sharingOn { self.isInternetSharingActive = sharingOn }
+            if self.sharingBridgeIP != bridgeIP { self.sharingBridgeIP = bridgeIP }
         }
     }
     
     func refreshWLANTelemetry() {
         guard let interface = CWWiFiClient.shared().interface() else { return }
-        let ssid = interface.ssid() ?? "Not Associated"
+        let ssid = interface.ssid() ?? L10n.text(.wlanNotAssociated)
         let bssid = interface.bssid() ?? "--:--:--:--:--:--"
         let rssi = interface.rssiValue()
         let noise = interface.noiseMeasurement()
         let txRate = interface.transmitRate()
         let channel = interface.wlanChannel()?.channelNumber ?? 0
-        let phyModeVal: String
-        switch interface.activePHYMode() {
-        case .mode11a: phyModeVal = "802.11a"
-        case .mode11b: phyModeVal = "802.11b"
-        case .mode11g: phyModeVal = "802.11g"
-        case .mode11n: phyModeVal = "802.11n"
-        case .mode11ac: phyModeVal = "802.11ac"
-        case .mode11ax: phyModeVal = "802.11ax (Wi-Fi 6)"
-        case .mode11be: phyModeVal = "802.11be (Wi-Fi 7)"
-        default: phyModeVal = "802.11 Mixed"
-        }
+        let phyModeVal = phyModeLabel(rawValue: Int(interface.activePHYMode().rawValue))
         DispatchQueue.main.async {
-            self.wlanSSID = ssid
-            self.wlanBSSID = bssid
-            self.wlanRSSI = rssi
-            self.wlanNoise = noise
-            self.wlanTxRate = txRate
-            self.wlanChannel = channel
-            self.wlanPhyMode = phyModeVal
+            // Publish only on change — avoids rebuilding the entire SwiftUI tree every tick.
+            if self.wlanSSID != ssid { self.wlanSSID = ssid }
+            if self.wlanBSSID != bssid { self.wlanBSSID = bssid }
+            if self.wlanRSSI != rssi { self.wlanRSSI = rssi }
+            if self.wlanNoise != noise { self.wlanNoise = noise }
+            if self.wlanTxRate != txRate { self.wlanTxRate = txRate }
+            if self.wlanChannel != channel { self.wlanChannel = channel }
+            if self.wlanPhyMode != phyModeVal { self.wlanPhyMode = phyModeVal }
         }
     }
     
-    func refreshSpeedometer() {
-        let targetInterface = isInternetSharingActive ? "bridge100" : "en0"
-        let output = shell("netstat -ib -I \(targetInterface)")
-        var currentIn: Double = 0.0
-        var currentOut: Double = 0.0
-        let lines = output.components(separatedBy: .newlines)
-        for line in lines {
-            if line.contains("<Link#") {
-                let parts = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-                if parts.count >= 10 {
-                    currentIn = Double(parts[6]) ?? 0.0
-                    currentOut = Double(parts[9]) ?? 0.0
-                    break
-                }
-            }
+    func refreshSpeedometer(sharingActive: Bool? = nil) {
+        // Prefer caller snapshot; never read @Published Bool from refreshQueue without it.
+        let active = sharingActive ?? false
+        // Prefer real sharing bridge device; never fall back to a VM bridge100.
+        let targetInterface = active ? (sharingBridgeDevice ?? "en0") : "en0"
+        if speedometerBaselineNeedsReset(previousInterface: lastSpeedInterface.isEmpty ? nil : lastSpeedInterface,
+                                         currentInterface: targetInterface) {
+            lastInBytes = 0
+            lastOutBytes = 0
         }
+        lastSpeedInterface = targetInterface
+        // ponytail: getifaddrs is ~0.05ms; netstat/Process was the old multi-ms path.
+        guard let (currentIn, currentOut) = interfaceByteCounters(named: targetInterface) else { return }
         let now = Date()
         let interval = now.timeIntervalSince(lastSpeedCheckTime)
         if lastInBytes > 0 && interval > 0 {
             let dlSpeed = ((currentIn - lastInBytes) / interval) / 1024.0
             let ulSpeed = ((currentOut - lastOutBytes) / interval) / 1024.0
+            let dl = max(0.0, dlSpeed)
+            let ul = max(0.0, ulSpeed)
+            let dlMB = currentIn / (1024.0 * 1024.0)
+            let ulMB = currentOut / (1024.0 * 1024.0)
             DispatchQueue.main.async {
-                self.downloadSpeed = max(0.0, dlSpeed)
-                self.uploadSpeed = max(0.0, ulSpeed)
-                self.totalDownloadMB = currentIn / (1024.0 * 1024.0)
-                self.totalUploadMB = currentOut / (1024.0 * 1024.0)
+                if abs(self.downloadSpeed - dl) > 0.05 { self.downloadSpeed = dl }
+                if abs(self.uploadSpeed - ul) > 0.05 { self.uploadSpeed = ul }
+                if abs(self.totalDownloadMB - dlMB) > 0.01 { self.totalDownloadMB = dlMB }
+                if abs(self.totalUploadMB - ulMB) > 0.01 { self.totalUploadMB = ulMB }
             }
         }
         lastInBytes = currentIn
@@ -243,23 +324,117 @@ class NetworkMonitor: ObservableObject {
     func toggleIntegratedHotspot(enable: Bool, primary: String, target: String, completion: @escaping (String, Bool) -> Void) {
         DispatchQueue.global(qos: .userInteractive).async {
             let cmd: String
+            var usedBypass = false
             if enable {
-                let configPrimary = "defaults write /Library/Preferences/SystemConfiguration/com.apple.nat NAT -dict PrimaryInterface '{ Device = \(primary); Enabled = 1; HardwarePort = \"Wi-Fi\"; }'"
-                let configSharing = "defaults write /Library/Preferences/SystemConfiguration/com.apple.nat NAT -dict-add SharingInterfaces '{ \(target) = { Device = \(target); Enabled = 1; HardwarePort = \"Wi-Fi\"; }; }'"
-                let configEnable = "defaults write /Library/Preferences/SystemConfiguration/com.apple.nat NAT -dict-add Enabled -int 1"
-                let loadDaemon = "launchctl load -w /System/Library/LaunchDaemons/com.apple.InternetSharing.plist"
-                cmd = "\(configPrimary) && \(configSharing) && \(configEnable) && \(loadDaemon)"
+                let securityRaw: Int = {
+                    if let iface = CWWiFiClient.shared().interface(withName: primary) {
+                        return Int(iface.security().rawValue)
+                    }
+                    if let iface = CWWiFiClient.shared().interface(), iface.interfaceName == primary {
+                        return Int(iface.security().rawValue)
+                    }
+                    return -1
+                }()
+                if isEnterprise8021XSecurity(rawValue: securityRaw) {
+                    guard isSafeBsdInterfaceName(primary), isSafeBsdInterfaceName(target) else {
+                        DispatchQueue.main.async {
+                            completion(L10n.format(.hotspotToggleError, "invalid interface name"), false)
+                        }
+                        return
+                    }
+                    usedBypass = true
+                    cmd = internetSharingBypassEnableShell(primaryDevice: primary, targetDevice: target)
+                } else {
+                    guard let service = self.lookupNetworkService(forDevice: primary) else {
+                        DispatchQueue.main.async {
+                            completion(L10n.format(.hotspotMissingPrimaryService, primary), false)
+                        }
+                        return
+                    }
+                    let ports = self.parseHardwarePorts()
+                    let readable = ports[primary] ?? service.readable
+                    cmd = internetSharingEnableShell(
+                        primaryDevice: primary,
+                        primaryReadable: readable,
+                        primaryService: service.serviceID,
+                        targetDevice: target
+                    )
+                }
             } else {
-                let disableFlag = "defaults write /Library/Preferences/SystemConfiguration/com.apple.nat NAT -dict-add Enabled -int 0"
-                let unloadDaemon = "launchctl unload -w /System/Library/LaunchDaemons/com.apple.InternetSharing.plist"
-                cmd = "\(disableFlag) && \(unloadDaemon)"
+                let markerRaw = (try? String(contentsOfFile: airbridgeShareMarkerPath, encoding: .utf8)) ?? ""
+                if let marker = parseAirbridgeShareMarker(markerRaw) {
+                    usedBypass = true
+                    cmd = internetSharingBypassDisableShell(targetDevice: marker.target)
+                } else if !target.isEmpty {
+                    // Prefer explicit target when stopping a just-enabled bypass whose marker vanished.
+                    let ifconfigRaw = shell("ifconfig")
+                    let block = ifconfigBlock(named: target, in: ifconfigRaw)
+                    if interfaceHasShareGatewayIP(ifconfigBlock: block) {
+                        usedBypass = true
+                        cmd = internetSharingBypassDisableShell(targetDevice: target)
+                    } else {
+                        cmd = internetSharingDisableShell()
+                    }
+                } else {
+                    cmd = internetSharingDisableShell()
+                }
             }
             let (msg, success) = AdminManager.runAsAdmin(cmd)
-            self.refreshData()
+            // Never open System Settings Sharing for 802.1X bypass — that UI only shows the 802.1X error.
+            if enable && success && !usedBypass {
+                _ = shell("open '\(internetSharingSettingsURL())'")
+            }
+            self.enqueueRefreshData()
             DispatchQueue.main.async {
-                completion(success ? "Hotspot toggled successfully." : "Error toggling hotspot: \(msg)", success)
+                if success {
+                    var notice: String
+                    if enable {
+                        notice = usedBypass
+                            ? L10n.text(.hotspotBypass8021XSuccess)
+                            : L10n.text(.hotspotConfiguredOpenSettings)
+                        if usedBypass {
+                            notice += L10n.text(.hotspotBypass8021XPolicyNote)
+                        }
+                    } else {
+                        notice = L10n.text(.hotspotToggleSuccess)
+                    }
+                    let ifconfigRaw = shell("ifconfig")
+                    let addresses = parseIfconfigOutput(ifconfigRaw)
+                    let hasVmBridge = addresses.ips.keys.contains { name in
+                        isLikelyVirtualMachineBridge(interfaceName: name, ifconfigOutput: ifconfigRaw)
+                    }
+                    if hasVmBridge && enable {
+                        notice += L10n.text(.hotspotVmConflictWarning)
+                    }
+                    completion(notice, true)
+                } else {
+                    completion(L10n.format(.hotspotToggleError, msg), false)
+                }
             }
         }
+    }
+
+    /// Resolve SystemConfiguration service UUID + readable name for a BSD device (e.g. en0).
+    private func lookupNetworkService(forDevice device: String) -> (serviceID: String, readable: String)? {
+        let listOut = shell("echo list | scutil")
+        var seen = Set<String>()
+        var serviceIDs: [String] = []
+        for line in listOut.components(separatedBy: .newlines) {
+            guard let range = line.range(of: "Setup:/Network/Service/") else { continue }
+            let rest = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            guard let uuid = rest.split(separator: "/").first.map(String.init), !uuid.isEmpty else { continue }
+            if seen.insert(uuid).inserted {
+                serviceIDs.append(uuid)
+            }
+        }
+        for uuid in serviceIDs {
+            let show = shell("echo 'show Setup:/Network/Service/\(uuid)/Interface' | scutil")
+            guard let parsed = parseScutilInterface(deviceNameFromShow: show), parsed.device == device else {
+                continue
+            }
+            return (uuid, parsed.readable)
+        }
+        return nil
     }
     
     func blockClient(client: ConnectedClient, completion: @escaping (String, Bool) -> Void) {
@@ -274,11 +449,11 @@ class NetworkMonitor: ObservableObject {
             if success {
                 DispatchQueue.main.async {
                     self.blockedMacs.insert(mac)
-                    self.refreshData()
+                    self.enqueueRefreshData()
                 }
             }
             DispatchQueue.main.async {
-                completion(success ? "Client \(client.hostname) has been blocked on firewall." : "Firewall Error: \(msg)", success)
+                completion(success ? L10n.format(.clientBlockedSuccess, client.hostname) : L10n.format(.firewallError, msg), success)
             }
         }
     }
@@ -295,7 +470,7 @@ class NetworkMonitor: ObservableObject {
                 }
             }
             DispatchQueue.main.async {
-                completion(success ? "Firewall rules flushed. Device is unblocked." : "Firewall Error: \(msg)", success)
+                completion(success ? L10n.text(.deviceUnblockedSuccess) : L10n.format(.firewallError, msg), success)
             }
         }
     }
@@ -312,7 +487,7 @@ class NetworkMonitor: ObservableObject {
         if !rules.isEmpty {
             _ = AdminManager.runAsAdmin("echo \"\(rules)\" | pfctl -a airbridge_block -f - && pfctl -e")
         }
-        self.refreshData()
+        self.enqueueRefreshData()
     }
     
     func applyDNSOverride(mode: String, completion: @escaping (String, Bool) -> Void) {
@@ -327,7 +502,7 @@ class NetworkMonitor: ObservableObject {
                 _ = AdminManager.runAsAdmin(removeCmd)
                 DispatchQueue.main.async {
                     self.currentDNSMode = "System Defaults"
-                    completion("DNS settings reverted to System Defaults.", true)
+                    completion(L10n.text(.dnsRevertedSuccess), true)
                 }
             }
             return
@@ -339,9 +514,9 @@ class NetworkMonitor: ObservableObject {
             DispatchQueue.main.async {
                 if success {
                     self.currentDNSMode = mode
-                    completion("Successfully configured shared bridge DNS to \(mode) (\(dnsServers.joined(separator: ", "))).", true)
+                    completion(L10n.format(.dnsConfiguredSuccess, mode, dnsServers.joined(separator: ", ")), true)
                 } else {
-                    completion("Error overriding DNS: \(msg)", false)
+                    completion(L10n.format(.dnsOverrideError, msg), false)
                 }
             }
         }
@@ -364,9 +539,9 @@ class NetworkMonitor: ObservableObject {
                         protocolType: protocolType
                     )
                     self.portRules.append(newRule)
-                    completion("Redirect rule successfully loaded in Packet Filter (Port \(external) ➡️ \(clientIP):\(internalPort)).", true)
+                    completion(L10n.format(.redirectRuleSuccess, external, clientIP, internalPort), true)
                 } else {
-                    completion("Error applying Redirect: \(msg)", false)
+                    completion(L10n.format(.redirectApplyError, msg), false)
                 }
             }
         }
@@ -391,7 +566,17 @@ class NetworkMonitor: ObservableObject {
         guard !isSniffing else { return }
         isSniffing = true
         snifferPackets.removeAll()
-        let bridge = isInternetSharingActive ? "bridge100" : "en0"
+        let bridge: String
+        if isInternetSharingActive {
+            if let ip = sharingBridgeIP,
+               let name = interfaces.first(where: { $0.ipAddress == ip })?.device {
+                bridge = name
+            } else {
+                bridge = "en0"
+            }
+        } else {
+            bridge = "en0"
+        }
         DispatchQueue.global(qos: .userInteractive).async {
             let snifferCmd = "tcpdump -c 15 -t -n -i \(bridge) ip"
             let (output, success) = AdminManager.runAsAdmin(snifferCmd)
@@ -434,7 +619,7 @@ class NetworkMonitor: ObservableObject {
                 _ = AdminManager.runAsAdmin(clearShaper)
                 DispatchQueue.main.async {
                     self.currentShaperSpeed = 0.0
-                    completion("Bandwidth shaper successfully disabled. Unlimited speed.", true)
+                    completion(L10n.text(.shaperDisabledSuccess), true)
                 }
                 return
             }
@@ -447,9 +632,9 @@ class NetworkMonitor: ObservableObject {
             DispatchQueue.main.async {
                 if success {
                     self.currentShaperSpeed = speedMbps
-                    completion("Successfully limited hotspot clients download bandwidth to \(Int(speedMbps)) Mbps.", true)
+                    completion(L10n.format(.shaperLimitedSuccess, Int(speedMbps)), true)
                 } else {
-                    completion("Dummynet Error: \(msg)", false)
+                    completion(L10n.format(.dummynetError, msg), false)
                 }
             }
         }
@@ -497,10 +682,10 @@ class NetworkMonitor: ObservableObject {
             DispatchQueue.main.async {
                 if success {
                     self.reservedIPs[cleanMac.lowercased()] = cleanIp
-                    self.refreshData()
-                    completion("Static lease configured inside /etc/bootpd.plist (MAC \(cleanMac) ➡️ IP \(cleanIp)).", true)
+                    self.enqueueRefreshData()
+                    completion(L10n.format(.staticLeaseSuccess, cleanMac, cleanIp), true)
                 } else {
-                    completion("DHCP Config Error: \(msg)", false)
+                    completion(L10n.format(.dhcpConfigError, msg), false)
                 }
             }
         }
@@ -528,39 +713,6 @@ class NetworkMonitor: ObservableObject {
             }
         }
         return ports
-    }
-    
-    private func parseIPAddresses() -> [String: String] {
-        var ips: [String: String] = [:]
-        let output = shell("ifconfig")
-        let sections = output.components(separatedBy: "\n")
-        var currentInterface = ""
-        for line in sections {
-            if line.isEmpty { continue }
-            if let firstWord = line.components(separatedBy: .whitespaces).first, firstWord.contains(":") {
-                currentInterface = firstWord.replacingOccurrences(of: ":", with: "")
-            }
-            if currentInterface.isEmpty { continue }
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("inet ") {
-                let parts = trimmed.components(separatedBy: .whitespaces)
-                if parts.count > 1 {
-                    ips[currentInterface] = parts[1]
-                }
-            }
-        }
-        return ips
-    }
-    
-    private func fetchMACAddress(device: String) -> String {
-        let output = shell("ifconfig \(device)")
-        for line in output.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("ether ") {
-                return trimmed.replacingOccurrences(of: "ether ", with: "").trimmingCharacters(in: .whitespaces)
-            }
-        }
-        return "Unknown"
     }
     
     private func fetchSSIDs(interfaces: [String]) -> [String: String] {
@@ -597,7 +749,7 @@ class NetworkMonitor: ObservableObject {
             let blocks = content.components(separatedBy: "}")
             for block in blocks {
                 if !block.contains("{") { continue }
-                var name = "Unknown Device"
+                var name = L10n.text(.unknownDevice)
                 var ip = ""
                 var mac = ""
                 let lines = block.components(separatedBy: .newlines)
@@ -708,23 +860,23 @@ struct ContentView: View {
                             )
                         )
                         .shadow(color: .cyan.opacity(0.3), radius: 5)
-                    Text("AirBridge Pro")
+                    Text(L10n.text(.appName))
                         .font(.system(.title3, design: .rounded))
                         .fontWeight(.bold)
                 }
                 .padding(.top, 20)
                 .padding(.bottom, 10)
                 
-                NavigationButton(icon: "chart.bar", title: "Dashboard", isSelected: selectedTab == 0) { selectedTab = 0 }
-                NavigationButton(icon: "laptopcomputer.and.iphone", title: "Devices & Block", isSelected: selectedTab == 1) { selectedTab = 1 }
-                NavigationButton(icon: "wifi.radar", title: "WLAN Telemetry", isSelected: selectedTab == 2) { selectedTab = 2 }
-                NavigationButton(icon: "arrow.up.left.and.down.right.and.arrow.up.right.and.down.left", title: "Port Forwarding", isSelected: selectedTab == 3) { selectedTab = 3 }
-                NavigationButton(icon: "lock.shield", title: "DNS & AdBlock", isSelected: selectedTab == 4) { selectedTab = 4 }
-                NavigationButton(icon: "terminal", title: "Packet Sniffer", isSelected: selectedTab == 5) { selectedTab = 5 }
-                NavigationButton(icon: "gauge.with.needle", title: "Bandwidth Shaper", isSelected: selectedTab == 6) { selectedTab = 6 }
-                NavigationButton(icon: "waveform.path.ecg", title: "Bridge Quality", isSelected: selectedTab == 7) { selectedTab = 7 }
-                NavigationButton(icon: "questionmark.circle", title: "Setup Guide", isSelected: selectedTab == 8) { selectedTab = 8 }
-                NavigationButton(icon: "person.crop.square", title: "Developer Info", isSelected: selectedTab == 9) { selectedTab = 9 }
+                NavigationButton(icon: "chart.bar", title: L10n.text(.navDashboard), isSelected: selectedTab == 0) { selectedTab = 0 }
+                NavigationButton(icon: "laptopcomputer.and.iphone", title: L10n.text(.navDevicesAndBlock), isSelected: selectedTab == 1) { selectedTab = 1 }
+                NavigationButton(icon: "wifi.radar", title: L10n.text(.navWlanTelemetry), isSelected: selectedTab == 2) { selectedTab = 2 }
+                NavigationButton(icon: "arrow.up.left.and.down.right.and.arrow.up.right.and.down.left", title: L10n.text(.navPortForwarding), isSelected: selectedTab == 3) { selectedTab = 3 }
+                NavigationButton(icon: "lock.shield", title: L10n.text(.navDnsAndAdBlock), isSelected: selectedTab == 4) { selectedTab = 4 }
+                NavigationButton(icon: "terminal", title: L10n.text(.navPacketSniffer), isSelected: selectedTab == 5) { selectedTab = 5 }
+                NavigationButton(icon: "gauge.with.needle", title: L10n.text(.navBandwidthShaper), isSelected: selectedTab == 6) { selectedTab = 6 }
+                NavigationButton(icon: "waveform.path.ecg", title: L10n.text(.navBridgeQuality), isSelected: selectedTab == 7) { selectedTab = 7 }
+                NavigationButton(icon: "questionmark.circle", title: L10n.text(.navSetupGuide), isSelected: selectedTab == 8) { selectedTab = 8 }
+                NavigationButton(icon: "person.crop.square", title: L10n.text(.navDeveloperInfo), isSelected: selectedTab == 9) { selectedTab = 9 }
                 
                 Spacer()
                 
@@ -732,13 +884,13 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 4) {
                             Image(systemName: "arrow.down.circle.fill").foregroundColor(.blue).font(.caption)
-                            Text(String(format: "%.1f KB/s", monitor.downloadSpeed))
+                            Text(L10n.format(.formatSpeedKBps, monitor.downloadSpeed))
                                 .font(.system(.caption2, design: .monospaced))
                                 .fontWeight(.bold)
                         }
                         HStack(spacing: 4) {
                             Image(systemName: "arrow.up.circle.fill").foregroundColor(.purple).font(.caption)
-                            Text(String(format: "%.1f KB/s", monitor.uploadSpeed))
+                            Text(L10n.format(.formatSpeedKBps, monitor.uploadSpeed))
                                 .font(.system(.caption2, design: .monospaced))
                                 .fontWeight(.bold)
                         }
@@ -800,7 +952,7 @@ struct ContentView: View {
                             .fill(monitor.isInternetSharingActive ? Color.green : Color.amberGlow)
                             .frame(width: 8, height: 8)
                             .shadow(color: (monitor.isInternetSharingActive ? Color.green : Color.amberGlow).opacity(0.5), radius: 3)
-                        Text(monitor.isInternetSharingActive ? "Repeater Active" : "Repeater Inactive")
+                        Text(monitor.isInternetSharingActive ? L10n.text(.repeaterActive) : L10n.text(.repeaterInactive))
                             .font(.system(.caption, design: .rounded))
                             .fontWeight(.semibold)
                     }
@@ -838,16 +990,40 @@ struct ContentView: View {
         }
         .frame(minWidth: 820, idealWidth: 900, maxWidth: .infinity, minHeight: 560, idealHeight: 640, maxHeight: .infinity)
         .background(VisualEffectView())
+        .onChange(of: monitor.interfaces) { _, faces in
+            applyDefaultInterfaceSelections(faces)
+        }
+    }
+
+    /// When pickers still hold placeholder en0/en1 (or empty), auto-select Wi-Fi source and iPhone USB target.
+    private func applyDefaultInterfaceSelections(_ faces: [NetworkInterface]) {
+        guard !faces.isEmpty else { return }
+        if sourceInt.isEmpty || sourceInt == "en0" {
+            if let wifi = faces.first(where: {
+                let t = $0.type.lowercased()
+                return t.contains("wi-fi") || t.contains("airport")
+            }) {
+                sourceInt = wifi.device
+            }
+        }
+        if targetInt.isEmpty || targetInt == "en1" {
+            let candidates = faces.map {
+                ShareTargetCandidate(device: $0.device, type: $0.type, isActive: $0.isActive)
+            }
+            if let device = selectDefaultShareTargetDevice(candidates) {
+                targetInt = device
+            }
+        }
     }
     
     private func dashboardView() -> some View {
         VStack(spacing: 20) {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Integrated Hotspot Controller")
+                Text(L10n.text(.hotspotControllerTitle))
                     .font(.headline)
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Source Interface (Wi-Fi/Client)")
+                        Text(L10n.text(.sourceInterfaceLabel))
                             .font(.caption2)
                             .foregroundColor(.secondary)
                         Picker("", selection: $sourceInt) {
@@ -860,7 +1036,7 @@ struct ContentView: View {
                     }
                     
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Hotspot Outgoing (AP)")
+                        Text(L10n.text(.hotspotOutgoingLabel))
                             .font(.caption2)
                             .foregroundColor(.secondary)
                         Picker("", selection: $targetInt) {
@@ -874,13 +1050,13 @@ struct ContentView: View {
                     Spacer()
                     if monitor.isInternetSharingActive {
                         Button(action: {
-                            monitor.toggleIntegratedHotspot(enable: false, primary: "", target: "") { msg, success in
+                            monitor.toggleIntegratedHotspot(enable: false, primary: sourceInt, target: targetInt) { msg, success in
                                 displayNotification(message: msg, success: success)
                             }
                         }) {
                             HStack {
                                 Image(systemName: "stop.circle.fill")
-                                Text("Stop Hotspot")
+                                Text(L10n.text(.stopHotspot))
                             }
                             .fontWeight(.semibold)
                             .foregroundColor(.white)
@@ -898,7 +1074,7 @@ struct ContentView: View {
                         }) {
                             HStack {
                                 Image(systemName: "play.circle.fill")
-                                Text("Start Hotspot")
+                                Text(L10n.text(.startHotspot))
                             }
                             .fontWeight(.semibold)
                             .foregroundColor(.white)
@@ -916,27 +1092,27 @@ struct ContentView: View {
             }
             
             VStack(alignment: .leading, spacing: 10) {
-                Text("Real-time Connection Flow")
+                Text(L10n.text(.connectionFlowTitle))
                     .font(.headline)
                     .foregroundColor(.secondary)
                 HStack(spacing: 12) {
                     TopologyNode(
                         title: monitor.wlanSSID,
-                        subtitle: "Source SSID",
+                        subtitle: L10n.text(.topologySourceSsid),
                         icon: "globe",
                         color: .blue
                     )
                     FlowConnector(isActive: true)
                     TopologyNode(
-                        title: "Mac Bridge",
-                        subtitle: monitor.sharingBridgeIP ?? "No Bridge IP",
+                        title: L10n.text(.topologyMacBridge),
+                        subtitle: monitor.sharingBridgeIP ?? L10n.text(.topologyNoBridgeIp),
                         icon: "laptopcomputer",
                         color: monitor.isInternetSharingActive ? .purple : .secondary
                     )
                     FlowConnector(isActive: monitor.isInternetSharingActive)
                     TopologyNode(
-                        title: "\(monitor.connectedClients.count) Devices",
-                        subtitle: "Shared Hotspot",
+                        title: L10n.format(.formatTopologyDeviceCount, monitor.connectedClients.count),
+                        subtitle: L10n.text(.topologySharedHotspot),
                         icon: "wifi",
                         color: monitor.isInternetSharingActive && monitor.connectedClients.count > 0 ? .green : .secondary
                     )
@@ -948,31 +1124,31 @@ struct ContentView: View {
             
             HStack(spacing: 15) {
                 StatCard(
-                    title: "Download Speed",
-                    value: String(format: "%.1f KB/s", monitor.downloadSpeed),
+                    title: L10n.text(.statDownloadSpeed),
+                    value: L10n.format(.formatSpeedKBps, monitor.downloadSpeed),
                     icon: "arrow.down.circle.fill",
                     color: .blue
                 )
                 StatCard(
-                    title: "Upload Speed",
-                    value: String(format: "%.1f KB/s", monitor.uploadSpeed),
+                    title: L10n.text(.statUploadSpeed),
+                    value: L10n.format(.formatSpeedKBps, monitor.uploadSpeed),
                     icon: "arrow.up.circle.fill",
                     color: .purple
                 )
                 StatCard(
-                    title: "Cumulative Data",
-                    value: String(format: "%.1f MB", monitor.totalDownloadMB + monitor.totalUploadMB),
+                    title: L10n.text(.statCumulativeData),
+                    value: L10n.format(.formatDataMB, monitor.totalDownloadMB + monitor.totalUploadMB),
                     icon: "externaldrive.fill",
                     color: .green
                 )
             }
             
             VStack(alignment: .leading, spacing: 10) {
-                Text("Detected Hardware interfaces")
+                Text(L10n.text(.detectedHardwareInterfaces))
                     .font(.headline)
                 ForEach(monitor.interfaces) { face in
                     InterfaceCard(face: face) {
-                        copyToClipboard(face.ipAddress ?? "", type: "IP Address")
+                        copyToClipboard(face.ipAddress ?? "", type: L10n.text(.clipboardItemIpAddress))
                     }
                 }
             }
@@ -982,12 +1158,12 @@ struct ContentView: View {
     private func devicesView() -> some View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Add Dynamic DHCP IP Reservation")
+                Text(L10n.text(.dhcpReservationTitle))
                     .font(.headline)
                 HStack(spacing: 10) {
-                    TextField("MAC Address (e.g. 3c:13:d6:23:10:f5)", text: $reserveMac)
+                    TextField(L10n.text(.placeholderMacAddress), text: $reserveMac)
                         .textFieldStyle(.roundedBorder)
-                    TextField("Desired IP Address (e.g. 192.168.2.80)", text: $reserveIp)
+                    TextField(L10n.text(.placeholderDesiredIp), text: $reserveIp)
                         .textFieldStyle(.roundedBorder)
                     Button(action: {
                         guard !reserveMac.isEmpty && !reserveIp.isEmpty else { return }
@@ -999,7 +1175,7 @@ struct ContentView: View {
                             }
                         }
                     }) {
-                        Text("Reserve Lease")
+                        Text(L10n.text(.reserveLease))
                             .fontWeight(.semibold)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
@@ -1014,14 +1190,14 @@ struct ContentView: View {
                 .cornerRadius(10)
             }
             
-            Text("Connected Clients Table")
+            Text(L10n.text(.connectedClientsTable))
                 .font(.headline)
             if monitor.connectedClients.isEmpty {
                 VStack(spacing: 15) {
                     Image(systemName: "wifi.slash")
                         .font(.system(size: 32))
                         .foregroundColor(.secondary)
-                    Text("No clients found on DHCP bridge network.")
+                    Text(L10n.text(.noClientsOnBridge))
                         .foregroundColor(.secondary)
                 }
                 .frame(maxWidth: .infinity)
@@ -1046,7 +1222,7 @@ struct ContentView: View {
                             }
                             Spacer()
                             if client.isReserved {
-                                Text("DHCP Reserved")
+                                Text(L10n.text(.dhcpReservedBadge))
                                     .font(.system(.caption2, design: .rounded))
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 2)
@@ -1060,7 +1236,7 @@ struct ContentView: View {
                                         displayNotification(message: msg, success: success)
                                     }
                                 }) {
-                                    Text("Unblock Device")
+                                    Text(L10n.text(.unblockDevice))
                                         .font(.caption)
                                         .fontWeight(.semibold)
                                         .padding(.horizontal, 10)
@@ -1076,7 +1252,7 @@ struct ContentView: View {
                                         displayNotification(message: msg, success: success)
                                     }
                                 }) {
-                                    Text("Block Client")
+                                    Text(L10n.text(.blockClient))
                                         .font(.caption)
                                         .fontWeight(.semibold)
                                         .padding(.horizontal, 10)
@@ -1099,11 +1275,11 @@ struct ContentView: View {
     
     private func telemetryView() -> some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("Detailed Wi-Fi Signal Diagnostics")
+            Text(L10n.text(.wifiDiagnosticsTitle))
                 .font(.headline)
             HStack(spacing: 15) {
                 VStack(spacing: 10) {
-                    Text("RSSI (Signal)")
+                    Text(L10n.text(.rssiSignal))
                         .font(.caption)
                         .foregroundColor(.secondary)
                     ZStack {
@@ -1115,7 +1291,7 @@ struct ContentView: View {
                             .stroke(monitor.wlanRSSI > -60 ? Color.green : (monitor.wlanRSSI > -80 ? Color.orange : Color.red), style: StrokeStyle(lineWidth: 10, lineCap: .round))
                             .frame(width: 100, height: 100)
                             .rotationEffect(.degrees(-90))
-                        Text("\(monitor.wlanRSSI) dBm")
+                        Text(L10n.format(.formatRssiDbm, monitor.wlanRSSI))
                             .font(.system(.body, design: .rounded))
                             .fontWeight(.bold)
                     }
@@ -1126,7 +1302,7 @@ struct ContentView: View {
                 .cornerRadius(12)
                 
                 VStack(spacing: 10) {
-                    Text("Noise Level")
+                    Text(L10n.text(.noiseLevel))
                         .font(.caption)
                         .foregroundColor(.secondary)
                     ZStack {
@@ -1138,7 +1314,7 @@ struct ContentView: View {
                             .stroke(Color.red, style: StrokeStyle(lineWidth: 10, lineCap: .round))
                             .frame(width: 100, height: 100)
                             .rotationEffect(.degrees(-90))
-                        Text("\(monitor.wlanNoise) dBm")
+                        Text(L10n.format(.formatRssiDbm, monitor.wlanNoise))
                             .font(.system(.body, design: .rounded))
                             .fontWeight(.bold)
                     }
@@ -1149,7 +1325,7 @@ struct ContentView: View {
                 .cornerRadius(12)
                 
                 VStack(spacing: 10) {
-                    Text("Link Tx Rate")
+                    Text(L10n.text(.linkTxRate))
                         .font(.caption)
                         .foregroundColor(.secondary)
                     ZStack {
@@ -1161,7 +1337,7 @@ struct ContentView: View {
                             .stroke(Color.blue, style: StrokeStyle(lineWidth: 10, lineCap: .round))
                             .frame(width: 100, height: 100)
                             .rotationEffect(.degrees(-90))
-                        Text(String(format: "%.0f Mbps", monitor.wlanTxRate))
+                        Text(L10n.format(.formatTxRateMbps, monitor.wlanTxRate))
                             .font(.system(.caption, design: .rounded))
                             .fontWeight(.bold)
                     }
@@ -1173,11 +1349,11 @@ struct ContentView: View {
             }
             
             VStack(spacing: 1) {
-                TelemetryRow(title: "Active SSID", value: monitor.wlanSSID)
-                TelemetryRow(title: "BSSID (Access Point)", value: monitor.wlanBSSID)
-                TelemetryRow(title: "Radio Channel", value: "\(monitor.wlanChannel)")
-                TelemetryRow(title: "PHY Standard Mode", value: monitor.wlanPhyMode)
-                TelemetryRow(title: "Signal-to-Noise Ratio (SNR)", value: "\(monitor.wlanRSSI - monitor.wlanNoise) dB")
+                TelemetryRow(title: L10n.text(.telemetryActiveSsid), value: monitor.wlanSSID)
+                TelemetryRow(title: L10n.text(.telemetryBssid), value: monitor.wlanBSSID)
+                TelemetryRow(title: L10n.text(.telemetryRadioChannel), value: "\(monitor.wlanChannel)")
+                TelemetryRow(title: L10n.text(.telemetryPhyStandard), value: monitor.wlanPhyMode)
+                TelemetryRow(title: L10n.text(.telemetrySnr), value: L10n.format(.formatSnrDb, monitor.wlanRSSI - monitor.wlanNoise))
             }
             .cornerRadius(10)
         }
@@ -1186,14 +1362,14 @@ struct ContentView: View {
     private func forwardingView() -> some View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Load Redirect Rule into Packet Filter (PF)")
+                Text(L10n.text(.portForwardFormTitle))
                     .font(.headline)
                 HStack(spacing: 12) {
-                    TextField("Ext Port (e.g. 8080)", text: $extPort)
+                    TextField(L10n.text(.placeholderExtPort), text: $extPort)
                         .textFieldStyle(.roundedBorder)
-                    TextField("Client IP (e.g. 192.168.2.5)", text: $clientIP)
+                    TextField(L10n.text(.placeholderClientIp), text: $clientIP)
                         .textFieldStyle(.roundedBorder)
-                    TextField("Int Port (e.g. 80)", text: $intPort)
+                    TextField(L10n.text(.placeholderIntPort), text: $intPort)
                         .textFieldStyle(.roundedBorder)
                     Picker("", selection: $selectedProto) {
                         Text("TCP").tag("TCP")
@@ -1212,7 +1388,7 @@ struct ContentView: View {
                             }
                         }
                     }) {
-                        Text("Add Rule")
+                        Text(L10n.text(.addRule))
                             .fontWeight(.semibold)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 6)
@@ -1227,14 +1403,14 @@ struct ContentView: View {
                 .cornerRadius(10)
             }
             
-            Text("Active Redirect Anchors")
+            Text(L10n.text(.activeRedirectAnchors))
                 .font(.headline)
             if monitor.portRules.isEmpty {
                 VStack(spacing: 15) {
                     Image(systemName: "shuffle.circle")
                         .font(.system(size: 32))
                         .foregroundColor(.secondary)
-                    Text("No active port forwarding redirects loaded.")
+                    Text(L10n.text(.noPortForwardingRules))
                         .foregroundColor(.secondary)
                 }
                 .frame(maxWidth: .infinity)
@@ -1253,7 +1429,7 @@ struct ContentView: View {
                                 .background(Color.blue.opacity(0.12))
                                 .foregroundColor(.blue)
                                 .cornerRadius(4)
-                            Text("External Port: \(rule.externalPort)")
+                            Text(L10n.format(.formatExternalPort, rule.externalPort))
                                 .fontWeight(.semibold)
                             Image(systemName: "arrow.right").foregroundColor(.secondary)
                             Text("\(rule.internalIP) : \(rule.internalPort)")
@@ -1278,21 +1454,21 @@ struct ContentView: View {
     
     private func dnsView() -> some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("Fast DNS Server Redirection")
+            Text(L10n.text(.dnsSectionTitle))
                 .font(.headline)
-            Text("Force all shared clients to resolve domain names through specific servers. Toggling DNS values updates bootpd.plist on the fly.")
+            Text(L10n.text(.dnsSectionDescription))
                 .foregroundColor(.secondary)
             VStack(spacing: 12) {
-                DNSTemplateCard(title: "System Defaults", desc: "Use the primary DNS server configured on your Mac's active interface.", isSelected: monitor.currentDNSMode == "System Defaults") {
+                DNSTemplateCard(title: L10n.text(.dnsCardSystemDefaultsTitle), desc: L10n.text(.dnsCardSystemDefaultsDesc), isSelected: monitor.currentDNSMode == "System Defaults") {
                     monitor.applyDNSOverride(mode: "Defaults") { msg, success in displayNotification(message: msg, success: success) }
                 }
-                DNSTemplateCard(title: "Cloudflare Fast DNS", desc: "Configures 1.1.1.1 & 1.0.0.1 for high-speed browsing and extreme privacy.", isSelected: monitor.currentDNSMode == "Cloudflare") {
+                DNSTemplateCard(title: L10n.text(.dnsCardCloudflareTitle), desc: L10n.text(.dnsCardCloudflareDesc), isSelected: monitor.currentDNSMode == "Cloudflare") {
                     monitor.applyDNSOverride(mode: "Cloudflare") { msg, success in displayNotification(message: msg, success: success) }
                 }
-                DNSTemplateCard(title: "Google Public DNS", desc: "Configures 8.8.8.8 & 8.8.4.4 for ultra-reliable global routing.", isSelected: monitor.currentDNSMode == "Google") {
+                DNSTemplateCard(title: L10n.text(.dnsCardGoogleTitle), desc: L10n.text(.dnsCardGoogleDesc), isSelected: monitor.currentDNSMode == "Google") {
                     monitor.applyDNSOverride(mode: "Google") { msg, success in displayNotification(message: msg, success: success) }
                 }
-                DNSTemplateCard(title: "AdGuard Ad-Blocker DNS", desc: "Configures 94.140.14.14 & 94.140.15.15 to automatically drop ad domains and telemetry tracking.", isSelected: monitor.currentDNSMode == "AdGuard (AdBlock)") {
+                DNSTemplateCard(title: L10n.text(.dnsCardAdGuardTitle), desc: L10n.text(.dnsCardAdGuardDesc), isSelected: monitor.currentDNSMode == "AdGuard (AdBlock)") {
                     monitor.applyDNSOverride(mode: "AdGuard (AdBlock)") { msg, success in displayNotification(message: msg, success: success) }
                 }
             }
@@ -1302,7 +1478,7 @@ struct ContentView: View {
     private func snifferView() -> some View {
         VStack(alignment: .leading, spacing: 15) {
             HStack {
-                Text("Live Packet Flow Terminal Capture (tcpdump)")
+                Text(L10n.text(.snifferTitle))
                     .font(.headline)
                 Spacer()
                 Button(action: {
@@ -1311,10 +1487,10 @@ struct ContentView: View {
                     HStack {
                         if monitor.isSniffing {
                             ProgressView().scaleEffect(0.6).frame(width: 15, height: 15)
-                            Text("Sniffing Live IP Packets...")
+                            Text(L10n.text(.snifferCapturing))
                         } else {
                             Image(systemName: "eye")
-                            Text("Capture Packets")
+                            Text(L10n.text(.snifferCapturePackets))
                         }
                     }
                     .foregroundColor(.white)
@@ -1326,7 +1502,7 @@ struct ContentView: View {
                 .buttonStyle(.plain)
                 .disabled(monitor.isSniffing)
             }
-            Text("Extracts active communication sockets from the active bridge interfaces. Safe, isolated sniffer automatically ends after 15 packet readings.")
+            Text(L10n.text(.snifferDescription))
                 .font(.caption)
                 .foregroundColor(.secondary)
             VStack {
@@ -1335,7 +1511,7 @@ struct ContentView: View {
                         Image(systemName: "terminal.fill")
                             .font(.system(size: 32))
                             .foregroundColor(.secondary)
-                        Text("Terminal Console is empty. Press Capture Packets above.")
+                        Text(L10n.text(.snifferConsoleEmpty))
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -1382,31 +1558,31 @@ struct ContentView: View {
     
     private func shaperView() -> some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("Bandwidth Throttler (Traffic Capper)")
+            Text(L10n.text(.shaperTitle))
                 .font(.headline)
-            Text("Throttle the download and upload bandwidth on all shared AP networks to prevent clients from consuming all your system's network capacity.")
+            Text(L10n.text(.shaperDescription))
                 .foregroundColor(.secondary)
             VStack(alignment: .leading, spacing: 15) {
                 HStack {
-                    Text("Cap Speed Rate:")
+                    Text(L10n.text(.capSpeedRateLabel))
                         .fontWeight(.semibold)
                     Spacer()
-                    Text(monitor.currentShaperSpeed == 0 ? "Unlimited" : "\(Int(monitor.currentShaperSpeed)) Mbps")
+                    Text(monitor.currentShaperSpeed == 0 ? L10n.text(.shaperUnlimited) : L10n.format(.formatShaperSpeedMbps, Int(monitor.currentShaperSpeed)))
                         .font(.system(.body, design: .monospaced))
                         .fontWeight(.bold)
                         .foregroundColor(.blue)
                 }
                 HStack(spacing: 12) {
-                    SpeedOptionButton(title: "Unlimited (Disable)", speed: 0.0, current: monitor.currentShaperSpeed) {
+                    SpeedOptionButton(title: L10n.text(.shaperOptionUnlimitedDisable), speed: 0.0, current: monitor.currentShaperSpeed) {
                         monitor.applySpeedLimiter(speedMbps: 0.0) { msg, success in displayNotification(message: msg, success: success) }
                     }
-                    SpeedOptionButton(title: "2 Mbps (Slow)", speed: 2.0, current: monitor.currentShaperSpeed) {
+                    SpeedOptionButton(title: L10n.text(.shaperOption2MbpsSlow), speed: 2.0, current: monitor.currentShaperSpeed) {
                         monitor.applySpeedLimiter(speedMbps: 2.0) { msg, success in displayNotification(message: msg, success: success) }
                     }
-                    SpeedOptionButton(title: "5 Mbps (Standard)", speed: 5.0, current: monitor.currentShaperSpeed) {
+                    SpeedOptionButton(title: L10n.text(.shaperOption5MbpsStandard), speed: 5.0, current: monitor.currentShaperSpeed) {
                         monitor.applySpeedLimiter(speedMbps: 5.0) { msg, success in displayNotification(message: msg, success: success) }
                     }
-                    SpeedOptionButton(title: "10 Mbps (Fast)", speed: 10.0, current: monitor.currentShaperSpeed) {
+                    SpeedOptionButton(title: L10n.text(.shaperOption10MbpsFast), speed: 10.0, current: monitor.currentShaperSpeed) {
                         monitor.applySpeedLimiter(speedMbps: 10.0) { msg, success in displayNotification(message: msg, success: success) }
                     }
                 }
@@ -1420,7 +1596,7 @@ struct ContentView: View {
     private func qualityView() -> some View {
         VStack(alignment: .leading, spacing: 20) {
             HStack {
-                Text("Active Repeater Ping Quality Diagnostics")
+                Text(L10n.text(.qualityTitle))
                     .font(.headline)
                 Spacer()
                 Button(action: {
@@ -1429,10 +1605,10 @@ struct ContentView: View {
                     HStack {
                         if monitor.isTestingPing {
                             ProgressView().scaleEffect(0.6).frame(width: 15, height: 15)
-                            Text("Pinging Target...")
+                            Text(L10n.text(.qualityPinging))
                         } else {
                             Image(systemName: "waveform.path.ecg")
-                            Text("Run Ping Diagnostic")
+                            Text(L10n.text(.qualityRunDiagnostic))
                         }
                     }
                     .foregroundColor(.white)
@@ -1444,18 +1620,18 @@ struct ContentView: View {
                 .buttonStyle(.plain)
                 .disabled(monitor.isTestingPing)
             }
-            Text("Pings high-reliability nodes (1.1.1.1) to measure real-time latency, connection quality, packet loss, and potential signal jitter added by the repeater bridge.")
+            Text(L10n.text(.qualityDescription))
                 .foregroundColor(.secondary)
             HStack(spacing: 15) {
                 VStack(spacing: 8) {
-                    Text("Connection Latency (RTT)")
+                    Text(L10n.text(.qualityLatencyRtt))
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    Text(String(format: "%.1f ms", monitor.pingLatency))
+                    Text(L10n.format(.formatLatencyMs, monitor.pingLatency))
                         .font(.system(.title, design: .rounded))
                         .fontWeight(.bold)
                         .foregroundColor(monitor.pingLatency == 0 ? .secondary : (monitor.pingLatency < 50 ? .green : (monitor.pingLatency < 120 ? .orange : .red)))
-                    Text(monitor.pingLatency == 0 ? "Diagnostic Idle" : (monitor.pingLatency < 50 ? "Excellent / Ideal" : "High Delay"))
+                    Text(monitor.pingLatency == 0 ? L10n.text(.qualityDiagnosticIdle) : (monitor.pingLatency < 50 ? L10n.text(.qualityExcellentIdeal) : L10n.text(.qualityHighDelay)))
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
@@ -1465,14 +1641,14 @@ struct ContentView: View {
                 .cornerRadius(10)
                 
                 VStack(spacing: 8) {
-                    Text("Packet Loss Rate")
+                    Text(L10n.text(.qualityPacketLossRate))
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    Text(String(format: "%.0f%%", monitor.pingLoss))
+                    Text(L10n.format(.formatPacketLossPercent, monitor.pingLoss))
                         .font(.system(.title, design: .rounded))
                         .fontWeight(.bold)
                         .foregroundColor(monitor.pingLoss == 0 ? .green : .red)
-                    Text(monitor.pingLoss == 0 ? "Perfect Quality" : "Dropped packets detected")
+                    Text(monitor.pingLoss == 0 ? L10n.text(.qualityPerfect) : L10n.text(.qualityDroppedPackets))
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
@@ -1486,29 +1662,29 @@ struct ContentView: View {
     
     private func setupGuideView() -> some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("Repeater Bridge Hardware Combinations")
+            Text(L10n.text(.setupSectionTitle))
                 .font(.headline)
             SetupMethodCard(
                 number: "1",
-                title: "Wi-Fi to Wi-Fi Repeater (Dual Wireless Interface)",
-                difficulty: "Requires USB Wi-Fi dongle",
-                desc: "Enable sharing from your primary built-in Wi-Fi interface (en0) connected to the internet, targeting your secondary USB Wi-Fi adapter (en1/en2) which broadcasts the SSID.",
+                title: L10n.text(.setupMethod1Title),
+                difficulty: L10n.text(.setupMethod1Difficulty),
+                desc: L10n.text(.setupMethod1Desc),
                 steps: [
-                    "Plug in your external USB Wi-Fi adapter.",
-                    "Select primary interface en0 and target en1 in Dashboard tab.",
-                    "Click 'Start Hotspot' in the integrated controller.",
-                    "Accept macOS administrative permission prompts to bind configuration."
+                    L10n.text(.setupMethod1Step1),
+                    L10n.text(.setupMethod1Step2),
+                    L10n.text(.setupMethod1Step3),
+                    L10n.text(.setupMethod1Step4)
                 ]
             )
             SetupMethodCard(
                 number: "2",
-                title: "Wi-Fi to Bluetooth PAN",
-                difficulty: "Zero hardware required, slower speeds",
-                desc: "Tethers your Mac's internet connection over the built-in Bluetooth transceiver to deliver data to client phones/tablets.",
+                title: L10n.text(.setupMethod2Title),
+                difficulty: L10n.text(.setupMethod2Difficulty),
+                desc: L10n.text(.setupMethod2Desc),
                 steps: [
-                    "Toggle Bluetooth PAN inside System Sharing pane.",
-                    "Pair your phone/tablet to the Mac via Bluetooth.",
-                    "Activate internet access over Bluetooth PAN on client."
+                    L10n.text(.setupMethod2Step1),
+                    L10n.text(.setupMethod2Step2),
+                    L10n.text(.setupMethod2Step3)
                 ]
             )
         }
@@ -1542,11 +1718,11 @@ struct ContentView: View {
                     Text("Tiwut")
                         .font(.system(.title3, design: .rounded))
                         .fontWeight(.bold)
-                    Text("Systems Architect & Developer")
+                    Text(L10n.text(.developerRole))
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
-                Text("Developer of AirBridge Pro. Building high-performance, sandboxed, and bare-metal system tools designed to empower developers and network administrators on macOS.")
+                Text(L10n.text(.developerBio))
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
@@ -1602,16 +1778,13 @@ struct ContentView: View {
             )
             
             VStack(alignment: .leading, spacing: 12) {
-                Text("System Diagnostics & Environment")
+                Text(L10n.text(.developerDiagnosticsTitle))
                     .font(.headline)
                 VStack(spacing: 1) {
-                    TelemetryRow(title: "Active Developer", value: "Tiwut")
-                    TelemetryRow(title: "Hostname", value: shell("hostname").trimmingCharacters(in: .whitespacesAndNewlines))
-                    TelemetryRow(title: "macOS OS Version", value: shell("sw_vers -productVersion").trimmingCharacters(in: .whitespacesAndNewlines))
-                    TelemetryRow(
-                        title: "Swift Version",
-                        value: shell("swift --version").components(separatedBy: .newlines).first?.replacingOccurrences(of: "Apple Swift version ", with: "").trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown"
-                    )
+                    TelemetryRow(title: L10n.text(.developerActiveDeveloper), value: "Tiwut")
+                    TelemetryRow(title: L10n.text(.developerHostname), value: ProcessInfo.processInfo.hostName)
+                    TelemetryRow(title: L10n.text(.developerMacosVersion), value: ProcessInfo.processInfo.operatingSystemVersionString)
+                    TelemetryRow(title: L10n.text(.developerSwiftVersion), value: L10n.text(.developerSwiftVersionValue))
                 }
                 .cornerRadius(10)
             }
@@ -1620,31 +1793,31 @@ struct ContentView: View {
     
     private func selectedTitle() -> String {
         switch selectedTab {
-        case 0: return "AirBridge Dashboard"
-        case 1: return "Client Management & Blocks"
-        case 2: return "WLAN Diagnostic Telemetry"
-        case 3: return "Integrated Port Forwarding"
-        case 4: return "Bridge Fast DNS Options"
-        case 5: return "Local Network Packet Sniffer"
-        case 6: return "Bandwidth Speed Capper"
-        case 7: return "Latency Quality Diagnostics"
-        case 8: return "Bridge Setup Guide"
-        default: return "About Developer Tiwut"
+        case 0: return L10n.text(.headerTitleDashboard)
+        case 1: return L10n.text(.headerTitleClientManagement)
+        case 2: return L10n.text(.headerTitleWlanTelemetry)
+        case 3: return L10n.text(.headerTitlePortForwarding)
+        case 4: return L10n.text(.headerTitleDns)
+        case 5: return L10n.text(.headerTitleSniffer)
+        case 6: return L10n.text(.headerTitleShaper)
+        case 7: return L10n.text(.headerTitleQuality)
+        case 8: return L10n.text(.headerTitleSetupGuide)
+        default: return L10n.text(.headerTitleAboutDeveloper)
         }
     }
     
     private func selectedSubtitle() -> String {
         switch selectedTab {
-        case 0: return "Real-time interface flow routing & Integrated controller."
-        case 1: return "Dynamic IP Firewall block listing & Static DHCP reservations."
-        case 2: return "Radio Signal strength metrics (RSSI), Channel, SNR, and Tx Link speeds."
-        case 3: return "Direct external port redirections to local bridge devices."
-        case 4: return "Override shared client DNS routing with zero ad AdGuard/Cloudflare tables."
-        case 5: return "Packet sniffing utility capturing bridge socket headers."
-        case 6: return "Set speed limits to manage overall data allocation."
-        case 7: return "Interactive latency statistics and packet drop checks."
-        case 8: return "Diagnostic information for repeater hardware."
-        default: return "Developer background, links, and local system environment specs."
+        case 0: return L10n.text(.headerSubtitleDashboard)
+        case 1: return L10n.text(.headerSubtitleClientManagement)
+        case 2: return L10n.text(.headerSubtitleWlanTelemetry)
+        case 3: return L10n.text(.headerSubtitlePortForwarding)
+        case 4: return L10n.text(.headerSubtitleDns)
+        case 5: return L10n.text(.headerSubtitleSniffer)
+        case 6: return L10n.text(.headerSubtitleShaper)
+        case 7: return L10n.text(.headerSubtitleQuality)
+        case 8: return L10n.text(.headerSubtitleSetupGuide)
+        default: return L10n.text(.headerSubtitleDeveloper)
         }
     }
     
@@ -1661,7 +1834,7 @@ struct ContentView: View {
         let pasteboard = NSPasteboard.general
         pasteboard.declareTypes([.string], owner: nil)
         pasteboard.setString(text, forType: .string)
-        displayNotification(message: "Copied \(type) \(text) to Clipboard.", success: true)
+        displayNotification(message: L10n.format(.copiedToClipboard, type, text), success: true)
     }
 }
 
@@ -1875,7 +2048,7 @@ struct InterfaceCard: View {
                         .cornerRadius(4)
                 }
                 if let ssid = face.ssid {
-                    Text("SSID: \(ssid)").font(.caption).foregroundColor(.blue)
+                    Text(L10n.format(.formatSsidLabel, ssid)).font(.caption).foregroundColor(.blue)
                 } else {
                     Text(face.macAddress.uppercased()).font(.system(.caption2, design: .monospaced)).foregroundColor(.secondary)
                 }
@@ -1884,7 +2057,7 @@ struct InterfaceCard: View {
             if face.isActive {
                 Button(action: copyAction) {
                     HStack(spacing: 4) {
-                        Text(face.ipAddress ?? "No IP").font(.system(.caption, design: .monospaced))
+                        Text(face.ipAddress ?? L10n.text(.interfaceNoIp)).font(.system(.caption, design: .monospaced))
                         Image(systemName: "doc.on.doc").font(.system(size: 9))
                     }
                     .padding(.horizontal, 8)
@@ -1895,7 +2068,7 @@ struct InterfaceCard: View {
                 }
                 .buttonStyle(.plain)
             } else {
-                Text("Inactive")
+                Text(L10n.text(.interfaceInactive))
                     .font(.caption2)
                     .foregroundColor(.secondary)
                     .padding(.horizontal, 8)
@@ -1970,7 +2143,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false)
         window.center()
-        window.title = "AirBridge Pro"
+        window.title = L10n.text(.appName)
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.contentView = NSHostingView(rootView: contentView)
